@@ -87,7 +87,7 @@ gopts.kspace = kspace;
 }
 ```
 
-**Same changes in src/sqpics.c src/grecon/optreg.c src/stl/misc.c src/simu/phantom.c src/stl/misc.c and So On (C language syntax incompatibility in Mac**
+**Same changes in src/sqpics.c src/grecon/optreg.c src/stl/misc.c src/simu/phantom.c src/stl/misc.c and So On (C language syntax incompatibility in Mac)**
 
 ## 6.compile for bart
 
