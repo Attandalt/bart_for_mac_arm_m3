@@ -1,0 +1,692 @@
+/* Copyright 2021-2022. Uecker Lab. University Medical Center Göttingen.
+ * Copyright 2021-2025. Institute of Biomedical Imaging. TU Graz.
+ * All rights reserved. Use of this source code is governed by
+ * a BSD-style license which can be found in the LICENSE file.
+ *
+ * Authors: Moritz Blumenthal
+ */
+
+#include <assert.h>
+#include <math.h>
+
+#include "num/ops.h"
+#include "num/ops_p.h"
+#include "num/multind.h"
+#include "num/flpmath.h"
+#include "num/iovec.h"
+
+#include "nlops/nlop.h"
+
+#include "misc/misc.h"
+#include "misc/types.h"
+
+#include "iter/batch_gen.h"
+#include "iter/italgos.h"
+#include "iter/vec.h"
+#include "iter/iter2.h"
+#include "iter/iter6_ops.h"
+#include "iter/monitor_iter6.h"
+#include "iter/iter_dump.h"
+#include "iter/prox.h"
+
+#include "iter6.h"
+
+#ifndef STRUCT_TMP_COPY
+#define STRUCT_TMP_COPY(x) ({ __typeof(x) __foo = (x); __typeof(__foo)* __foo2 = alloca(sizeof(__foo)); *__foo2 = __foo; __foo2; })
+#endif
+#define NLOP2ITNLOP(nlop) (struct iter_nlop_s){ (NULL == nlop) ? NULL : iter6_nlop, CAST_UP(STRUCT_TMP_COPY(((struct iter6_nlop_s){ { &TYPEID(iter6_nlop_s) }, nlop }))) }
+#define NLOP2IT_ADJ_ARR(nlop) ({											\
+	long NO = nlop_get_nr_out_args(nlop);										\
+	long NI = nlop_get_nr_in_args(nlop);										\
+	const struct operator_s** adj_ops = (const struct operator_s**)alloca((size_t)((long)sizeof(struct operator_s*) * NI * NO));	\
+	bool* der_out = (bool*)alloca((size_t)((long)sizeof(bool) * NI));						\
+	for (int o = 0; o < NO; o++)											\
+		for (int i = 0; i < NI; i++)										\
+			adj_ops[i * NO + o] = nlop_get_derivative(nlop, o, i)->adjoint;					\
+	struct iter6_op_arr_s adj_ops_data = { { &TYPEID(iter6_op_arr_s) }, NI, NO, adj_ops, NULL, -1, der_out };	\
+	(struct iter_op_arr_s){ iter6_op_arr_fun_deradj, CAST_UP(STRUCT_TMP_COPY(adj_ops_data)) };			\
+})
+
+
+DEF_TYPEID(iter6_sgd_conf);
+DEF_TYPEID(iter6_adadelta_conf);
+DEF_TYPEID(iter6_adam_conf);
+DEF_TYPEID(iter6_iPALM_conf);
+
+
+// needed because clang complains when overriding initialized members
+#define	ITER6_DEFAULT					\
+	.super.epochs = 1,				\
+	.super.clip_norm = 0.,				\
+	.super.clip_val = 0.,				\
+	.super.weight_decay = 0.,			\
+	.super.history_filename = NULL,			\
+	.super.dump_filename = NULL,			\
+	.super.dump_mod = -1,				\
+	.super.batchnorm_momentum = .95,		\
+	.super.batchgen_type = BATCH_GEN_SAME,		\
+	.super.batch_seed = 123,			\
+	.super.dump_flag = 0,				\
+	.super.min_learning_rate = 0.,			\
+	.super.epochs_warmup = 0.,			\
+	.super.monitor_averaged_objective = false,	\
+	.super.learning_rate_epoch_mod = 0,
+
+const struct iter6_sgd_conf iter6_sgd_conf_defaults = {
+
+	.super.TYPEID = &TYPEID2(iter6_sgd_conf),
+
+	ITER6_DEFAULT
+
+	.super.learning_rate = 0.001,
+
+	.momentum = 0.
+};
+
+
+const struct iter6_adadelta_conf iter6_adadelta_conf_defaults = {
+
+	.super.TYPEID = &TYPEID2(iter6_adadelta_conf),
+
+	ITER6_DEFAULT
+
+	.super.learning_rate = 1.,
+
+	.rho = 0.95
+};
+
+const struct iter6_adam_conf iter6_adam_conf_defaults = {
+
+	.super.TYPEID = &TYPEID2(iter6_adam_conf),
+
+	ITER6_DEFAULT
+
+	.super.learning_rate = .001,
+
+	.reset_epoch = -1,
+
+	.epsilon = 1.e-7,
+
+	.beta1 = 0.9,
+	.beta2 = 0.999,
+};
+
+const struct iter6_iPALM_conf iter6_iPALM_conf_defaults = {
+
+	.super.TYPEID = &TYPEID2(iter6_iPALM_conf),
+
+	ITER6_DEFAULT
+
+	.super.learning_rate = 1.,
+
+	.Lmin = 1.e-10,
+	.Lmax = 1.e+10,
+	.Lshrink = 1.2,
+	.Lincrease = 2.,
+
+	.alpha = -1.,
+	.beta = -1.,
+	.convex = false,
+
+	.trivial_stepsize = false,
+
+	.alpha_arr = NULL,
+	.beta_arr = NULL,
+	.convex_arr = NULL,
+
+	.reduce_momentum = true,
+};
+
+
+
+struct iter6_nlop_s {
+
+	iter_op_data super;
+
+	const struct nlop_s* nlop;
+};
+
+DEF_TYPEID(iter6_nlop_s);
+
+static void iter6_nlop(iter_op_data* _o, int OO, int II, float* args[OO + II], bool der_out[OO], bool der_in[II])
+{
+	const auto data = CAST_DOWN(iter6_nlop_s, _o);
+
+	assert(OO + II == operator_nr_args(data->nlop->op));
+
+	bool der[II?:1][OO?:1];
+
+	for (int i = 0; i < II; i++)
+		for (int o = 0; o < OO; o++)
+			der[i][o] = ((NULL == der_out) || der_out[o]) && ((NULL == der_in) || der_in[i]);
+
+	nlop_generic_apply_select_derivative_array_unchecked(data->nlop, OO, II, (void*)args, der);
+}
+
+struct iter6_op_arr_s {
+
+	iter_op_data super;
+
+	long NO;
+	long NI;
+
+	const struct operator_s** ops;
+
+	const struct operator_s* oops;
+	int i_index;
+	bool* der_out;
+};
+
+DEF_TYPEID(iter6_op_arr_s);
+
+static void iter6_op_arr_fun_deradj(iter_op_data* _o, int NO, float* dst[NO], int NI, const float* src[NI])
+{
+	const auto data = CAST_DOWN(iter6_op_arr_s, _o);
+
+	assert(NO == data->NO);
+	assert(NI == data->NI);
+	int i_index = -1;
+
+	for (int i = 0; i < data->NI; i++) {
+
+		if (NULL == src[i])
+			continue;
+
+		assert(-1 == i_index);
+		i_index = i;
+	}
+
+	assert(-1 != i_index);
+
+	const struct operator_s* op_arr[NO];
+	float* dst_t[NO];
+	int NO_t = 0;
+
+	bool cached = (i_index == data->i_index);
+	data->i_index = i_index;
+
+	for (int o = 0; o < NO; o++) {
+
+		cached = cached && (data->der_out[o] != (NULL == dst[o]));
+		data->der_out[o] = (NULL != dst[o]);
+
+		if (NULL == dst[o])
+			continue;
+
+		op_arr[NO_t] = data->ops[o * data->NI + i_index];
+		dst_t[NO_t] = dst[o];
+		NO_t += 1;
+	}
+
+#if 1
+
+	if (!cached) {
+
+		if (NULL != data->oops)
+			operator_free(data->oops);
+
+		data->oops = operator_apply_joined_create(NO_t, op_arr);
+	}
+
+	void* args[NO_t + 1];
+
+	for (int i = 0; i < NO_t; i++)
+		args[i] = dst_t[i];
+
+	args[NO_t] = (void*)src[i_index];
+
+	operator_generic_apply_unchecked(data->oops, NO_t + 1, args);
+#else
+	operator_apply_joined_unchecked(NO_t, op_arr, (complex float**)dst_t, (const complex float*)(src[0]));
+#endif
+}
+
+static const struct iter_dump_s* iter6_dump_default_create(const char* base_filename, long save_mod, const struct nlop_s* nlop, unsigned long save_flag, long NI, enum IN_TYPE in_type[NI])
+{
+	int D[NI];
+	const long* dims[NI];
+	bool save_array[NI];
+
+	bool guess_save_flag = (0UL == save_flag);
+
+	for (int i = 0; i < NI; i++) {
+
+		D[i] = nlop_generic_domain(nlop, i)->N;
+		dims[i] = nlop_generic_domain(nlop, i)->dims;
+
+		if (guess_save_flag) {
+
+			save_array[i] = ((IN_OPTIMIZE == in_type[i]) || (IN_BATCHNORM == in_type[i]) || (IN_STATIC == in_type[i]));
+		} else {
+
+			assert(i < 8 * (long)sizeof(save_flag));
+			save_array[i] = MD_IS_SET(save_flag, i);
+		}
+	}
+
+	return iter_dump_default_create(base_filename, save_mod, NI, save_array, D, dims);
+}
+
+static const struct operator_p_s* get_update_operator(const iter6_conf* conf, int N, const long dims[N], long numbatches)
+{
+	const auto conf_adadelta = CAST_MAYBE(iter6_adadelta_conf, conf);
+
+	if (NULL != conf_adadelta)
+		return operator_adadelta_update_create(N, dims, conf_adadelta->rho, 1.e-7);
+
+	auto conf_sgd = CAST_MAYBE(iter6_sgd_conf, conf);
+
+	if (NULL != conf_sgd)
+		return operator_sgd_update_create(N, dims);
+
+	auto conf_adam = CAST_MAYBE(iter6_adam_conf, conf);
+
+	if (NULL != conf_adam)
+		return operator_adam_update_create(N, dims, conf_adam->beta1, conf_adam->beta2, conf_adam->epsilon, numbatches * conf_adam->reset_epoch);
+
+	error("iter6_conf not SGD-like!\n");
+}
+
+static void get_learning_rate_schedule_cosine_annealing(int epochs, int numbatches,
+		float learning_rate, float min_learning_rate, int epoch_mod,
+		float (*result)[epochs][numbatches])
+{
+	if (1 >= epoch_mod)
+		return;
+
+	assert(0 <= min_learning_rate);
+
+	for (int ie = 0; ie < epochs; ie++)
+		for (int ib = 0; ib < numbatches; ib++)
+			(*result)[ie][ib] = min_learning_rate + 0.5 * (learning_rate - min_learning_rate)
+								* (1. + cosf(M_PI * (float)(ie % epoch_mod) / (float)(epoch_mod - 1)));
+}
+
+
+static void get_learning_rate_schedule_exponential_decay(int epochs, int numbatches,
+		float learning_rate, float min_learning_rate,
+		float (*result)[epochs][numbatches])
+{
+	long dims[2] = { numbatches, epochs };
+
+	if (0 >= min_learning_rate)
+		return;
+
+	assert(0 <= min_learning_rate);
+
+	for (int ie = 0; ie < dims[1]; ie++)
+		for (int ib = 0; ib < dims[0]; ib++)
+			(*result)[ie][ib] = learning_rate * (expf(((float)ie) / (epochs - 1) * logf(min_learning_rate / learning_rate)));
+}
+
+
+static void learning_rate_schedule_add_warmup(int epochs, int numbatches, float learning_rate,
+		int epochs_warmup, float (*schedule)[epochs][numbatches])
+{
+	if (0 == epochs_warmup)
+		return;
+
+	for (int ie = epochs_warmup; ie < epochs; ie++)
+		for (int ib = 0; ib < numbatches; ib++)
+			(*schedule)[ie][ib] = (*schedule)[ie - epochs_warmup][ib];
+
+	for (int ie = 0; ie < epochs_warmup; ie++)
+		for (int ib = 0; ib < numbatches; ib++)
+			(*schedule)[ie][ib] = learning_rate / (float)(epochs_warmup * numbatches) * (float)(ie * numbatches + ib);
+}
+
+
+
+void iter6_sgd_like(	const iter6_conf* conf,
+			const struct nlop_s* nlop,
+			long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+			long NO, enum OUT_TYPE out_type[NO],
+			int batchsize, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	struct iter_nlop_s nlop_iter = NLOP2ITNLOP(nlop);
+	struct iter_op_arr_s adj_op_arr = NLOP2IT_ADJ_ARR(nlop);
+	struct iter_nlop_s nlop_batch_gen_iter = NLOP2ITNLOP(nlop_batch_gen);
+
+	const struct operator_p_s* prox_ops_weight_decay[NI];
+
+	for (int i = 0; i < NI; i++) {
+
+		prox_ops_weight_decay[i] = NULL;
+
+		if ((0 != conf->weight_decay) && (NULL == prox_ops[i]) && (IN_OPTIMIZE == in_type[i])) {
+
+			prox_ops_weight_decay[i] = prox_leastsquares_create(nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims, conf->weight_decay, NULL);
+			prox_ops[i] = prox_ops_weight_decay[i];
+		}
+	}
+
+	struct iter_op_p_s prox_iter[NI];
+
+	for (int i = 0; i < NI; i++)
+		prox_iter[i] = OPERATOR_P2ITOP((NULL == prox_ops ? NULL : prox_ops[i]));
+
+	long isize[NI];
+	long osize[NO];
+
+	//array of update operators
+	const struct operator_p_s* upd_ops[NI];
+
+	for (int i = 0; i < NI; i++) {
+
+		upd_ops[i] = NULL;
+
+		if (IN_OPTIMIZE != in_type[i])
+			continue;
+
+		upd_ops[i] = get_update_operator(conf, nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims, numbatches);
+
+		if ((0. != conf->clip_norm) || (0. != conf->clip_val)) {
+
+			const struct operator_s* tmp1 = operator_clip_create(nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims, conf->clip_norm, conf->clip_val);
+			const struct operator_p_s* tmp2 = upd_ops[i];
+
+			upd_ops[i] = operator_p_pre_chain(tmp1, tmp2);
+
+			operator_free(tmp1);
+			operator_p_free(tmp2);
+		}
+	}
+
+	struct iter_op_p_s upd_iter_ops[NI];
+
+	for (int i = 0; i < NI; i++)
+		upd_iter_ops[i] = OPERATOR_P2ITOP(upd_ops[i]);
+
+	for (int i = 0; i < NI; i++)
+		isize[i] = 2 * md_calc_size(nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims);
+
+	for (int o = 0; o < NO; o++)
+		osize[o] = 2 * md_calc_size(nlop_generic_codomain(nlop, o)->N, nlop_generic_codomain(nlop, o)->dims);
+
+	//gpu ref (dst[i] can be null if batch_gen)
+	float* gpu_ref = NULL;
+
+	for (int i = 0; i < NI; i++)
+		if (IN_OPTIMIZE == in_type[i])
+			gpu_ref = dst[i];
+
+	assert(NULL != gpu_ref);
+
+	bool free_monitor = (NULL == monitor);
+
+	if (free_monitor)
+		monitor = monitor_iter6_create(true, false, 0, NULL);
+
+	if (conf->monitor_averaged_objective)
+		monitor6_average_objective(monitor);
+
+
+	const struct iter_dump_s* dump = NULL;
+
+	if (   (NULL != conf->dump_filename)
+	    && (0 < conf->dump_mod))
+		dump = iter6_dump_default_create(conf->dump_filename, conf->dump_mod, nlop, conf->dump_flag, NI, in_type);
+
+	long dims[2] = { numbatches, conf->epochs };
+
+	float (*learning_rate_schedule)[conf->epochs][numbatches] = md_alloc(2, dims, FL_SIZE);
+
+	for (int ie = 0; ie < conf->epochs; ie++)
+		for (int ib = 0; ib < numbatches; ib++)
+			(*learning_rate_schedule)[ie][ib] = conf->learning_rate;
+
+	if (0 < conf->min_learning_rate) {
+
+		if (conf->learning_rate_epoch_mod)
+			get_learning_rate_schedule_cosine_annealing(conf->epochs, numbatches,
+					conf->learning_rate, conf->min_learning_rate, conf->learning_rate_epoch_mod,
+					learning_rate_schedule);
+		else
+			get_learning_rate_schedule_exponential_decay(conf->epochs, numbatches,
+					conf->learning_rate, conf->min_learning_rate,
+					learning_rate_schedule);
+	}
+
+
+	learning_rate_schedule_add_warmup(conf->epochs, numbatches,
+			conf->learning_rate, conf->epochs_warmup, learning_rate_schedule);
+
+	sgd(	conf->epochs, numbatches,
+		conf->learning_rate, conf->batchnorm_momentum,
+		learning_rate_schedule,
+		NI, isize, in_type, dst,
+		NO, osize, out_type,
+		batchsize, batchsize * numbatches,
+		select_vecops(gpu_ref),
+		nlop_iter, adj_op_arr,
+		upd_iter_ops,
+		prox_iter,
+		nlop_batch_gen_iter,
+		(struct iter_op_s){ NULL, NULL }, monitor, dump);
+
+	for (int i = 0; i < NI; i++)
+		operator_p_free(upd_ops[i]);
+
+	if (NULL != conf->history_filename)
+		monitor_iter6_dump_record(monitor, conf->history_filename);
+
+	if (free_monitor)
+		monitor_iter6_free(monitor);
+
+	if (NULL != dump)
+		iter_dump_free(dump);
+
+	for (int i = 0; i < NI; i++) {
+
+		if (NULL != prox_ops_weight_decay[i])
+			continue;
+
+		operator_p_free(prox_ops_weight_decay[i]);
+		prox_ops[i] = NULL;
+	}
+
+	operator_free(CAST_DOWN(iter6_op_arr_s, adj_op_arr.data)->oops);
+
+	md_free(learning_rate_schedule);
+}
+
+
+void iter6_adadelta(	const iter6_conf* _conf,
+			const struct nlop_s* nlop,
+			long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+			long NO, enum OUT_TYPE out_type[NO],
+			int batchsize, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	auto conf = CAST_MAYBE(iter6_adadelta_conf, _conf);
+	assert(NULL != conf);
+
+	iter6_sgd_like(	_conf,
+			nlop,
+			NI, in_type, prox_ops, dst,
+			NO, out_type,
+			batchsize, numbatches, nlop_batch_gen, monitor);
+}
+
+
+void iter6_adam(const iter6_conf* _conf,
+		const struct nlop_s* nlop,
+		long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+		long NO, enum OUT_TYPE out_type[NO],
+		int batchsize, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	auto conf = CAST_MAYBE(iter6_adam_conf, _conf);
+	assert(NULL != conf);
+
+	iter6_sgd_like(	_conf,
+			nlop,
+			NI, in_type, prox_ops, dst,
+			NO, out_type,
+			batchsize, numbatches, nlop_batch_gen, monitor);
+}
+
+
+void iter6_sgd(		const iter6_conf* _conf,
+			const struct nlop_s* nlop,
+			long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+			long NO, enum OUT_TYPE out_type[NO],
+			int batchsize, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	auto conf = CAST_MAYBE(iter6_sgd_conf, _conf);
+	assert(NULL != conf);
+
+	iter6_sgd_like(	_conf,
+			nlop,
+			NI, in_type, prox_ops, dst,
+			NO, out_type,
+			batchsize, numbatches, nlop_batch_gen, monitor);
+}
+
+
+void iter6_iPALM(	const iter6_conf* _conf,
+			const struct nlop_s* nlop,
+			long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+			long NO, enum OUT_TYPE out_type[NO],
+			int /*batchsize*/, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	auto conf = CAST_DOWN(iter6_iPALM_conf, _conf);
+
+	//Compute sizes
+	long isize[NI];
+	long osize[NO];
+
+	for (int i = 0; i < NI; i++)
+		isize[i] = 2 * md_calc_size(nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims);
+
+	for (int o = 0; o < NO; o++)
+		osize[o] = 2 * md_calc_size(nlop_generic_codomain(nlop, o)->N, nlop_generic_codomain(nlop, o)->dims);
+
+	//create iter operators
+	struct iter_nlop_s nlop_iter = NLOP2ITNLOP(nlop);
+	struct iter_op_arr_s adj_op_arr = NLOP2IT_ADJ_ARR(nlop);
+	struct iter_nlop_s nlop_batch_gen_iter = NLOP2ITNLOP(nlop_batch_gen);
+
+	const struct operator_p_s* prox_ops_weight_decay[NI];
+
+	for (int i = 0; i < NI; i++) {
+
+		prox_ops_weight_decay[i] = NULL;
+
+		if ((0 != conf->super.weight_decay) && (NULL == prox_ops[i]) && (IN_OPTIMIZE == in_type[i])) {
+
+			prox_ops_weight_decay[i] = prox_leastsquares_create(nlop_generic_domain(nlop, i)->N, nlop_generic_domain(nlop, i)->dims, conf->super.weight_decay, NULL);
+			prox_ops[i] = prox_ops_weight_decay[i];
+		}
+	}
+
+	struct iter_op_p_s prox_iter[NI];
+
+	for (int i = 0; i < NI; i++)
+		prox_iter[i] = OPERATOR_P2ITOP(prox_ops[i]);
+
+	//compute parameter arrays
+	float alpha[NI];
+	float beta[NI];
+	bool convex[NI];
+
+	for (int i = 0; i < NI; i++) {
+
+		alpha[i] = (NULL == conf->alpha_arr) ? conf->alpha : conf->alpha_arr[i];
+		beta[i] = (NULL == conf->beta_arr) ? conf->beta : conf->beta_arr[i];
+		convex[i] = (NULL == conf->convex_arr) ? conf->convex : conf->convex_arr[i];
+	}
+
+	//gpu ref (dst[i] can be null if batch_gen)
+	float* gpu_ref = NULL;
+
+	for (int i = 0; i < NI; i++)
+		if (IN_OPTIMIZE == in_type[i])
+			gpu_ref = dst[i];
+
+	assert(NULL != gpu_ref);
+
+	float* x_old[NI];
+
+	for (int i = 0; i < NI; i++) {
+
+		x_old[i] = NULL;
+
+		if (IN_OPTIMIZE == in_type[i])
+			x_old[i] = md_alloc_sameplace(1, isize + i, FL_SIZE, gpu_ref);
+	}
+
+
+	float lipshitz_constants[NI];
+
+	for (int i = 0; i < NI; i++)
+		lipshitz_constants[i] = 1. / conf->super.learning_rate;
+
+	bool free_monitor = (NULL == monitor);
+
+	if (free_monitor)
+		monitor = monitor_iter6_create(true, false, 0, NULL);
+
+	if (_conf->monitor_averaged_objective)
+		monitor6_average_objective(monitor);
+
+	const struct iter_dump_s* dump = NULL;
+
+	if (   (NULL != conf->super.dump_filename)
+	    && (0 < conf->super.dump_mod))
+		dump = iter6_dump_default_create(conf->super.dump_filename,conf->super.dump_mod, nlop, conf->super.dump_flag, NI, in_type);
+
+	iPALM(	NI, isize, in_type, dst, x_old,
+		NO, osize, out_type,
+		numbatches, 0, conf->super.epochs,
+		select_vecops(gpu_ref),
+		alpha, beta, convex, conf->trivial_stepsize, conf->reduce_momentum,
+		lipshitz_constants, conf->Lmin, conf->Lmax, conf->Lshrink, conf->Lincrease,
+		nlop_iter, adj_op_arr,
+		prox_iter,
+		conf->super.batchnorm_momentum,
+		nlop_batch_gen_iter,
+		(struct iter_op_s){ NULL, NULL }, monitor, dump);
+
+	if (NULL != conf->super.history_filename)
+		monitor_iter6_dump_record(monitor, conf->super.history_filename);
+
+	if (free_monitor)
+		monitor_iter6_free(monitor);
+
+	for (int i = 0; i < NI; i++)
+		if (IN_OPTIMIZE == in_type[i])
+			md_free(x_old[i]);
+
+	if (NULL != dump)
+		iter_dump_free(dump);
+
+	for (int i = 0; i < NI; i++) {
+
+		if (NULL == prox_ops_weight_decay[i])
+			continue;
+
+		operator_p_free(prox_ops_weight_decay[i]);
+		prox_ops[i] = NULL;
+	}
+
+	operator_free(CAST_DOWN(iter6_op_arr_s, adj_op_arr.data)->oops);
+}
+
+
+void iter6_by_conf(	const iter6_conf* _conf,
+			const struct nlop_s* nlop,
+			long NI, enum IN_TYPE in_type[NI], const struct operator_p_s* prox_ops[NI], float* dst[NI],
+			long NO, enum OUT_TYPE out_type[NO],
+			int batchsize, int numbatches, const struct nlop_s* nlop_batch_gen, struct monitor_iter6_s* monitor)
+{
+	auto algo = iter6_sgd_like;
+
+	if (CAST_MAYBE(iter6_iPALM_conf, _conf))
+	       algo = iter6_iPALM;
+
+	algo(	_conf,
+		nlop,
+		NI, in_type, prox_ops, dst,
+		NO, out_type,
+		batchsize, numbatches, nlop_batch_gen, monitor);
+}
+

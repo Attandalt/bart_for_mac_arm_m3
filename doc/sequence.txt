@@ -1,0 +1,66 @@
+INCLUDED HEADERS IN SEQUENCE & SEQUENCE UI
+
+	#include "src/seq/event.h" // only sequence
+	#include "src/seq/seq.h"
+	#include "src/seq/helpers.h"
+	#include "src/seq/custom_ui.h"
+
+
+EXPORTED FUNCTIONS
+
+	MEMORY HANDLING / COMPATIBILITY CHECK
+		bart_seq_alloc
+		bart_seq_defaults
+		bart_seq_free
+		bart_seq_prepare
+		bart_seq_version_check
+
+	EVENT GENERATION
+		seq_block
+		seq_continue
+
+	SPECIAL TIMING
+		seq_block_end
+		seq_block_end_flat
+		seq_block_rdt
+
+	DISCRETIZATION GRADIENTS / PULSES
+		seq_compute_gradients
+		seq_sample_rf_shapes
+
+	EVENT / PULSE INTERPRETATION
+		seq_nco_freq
+		seq_nco_phase
+		seq_cfl_to_sample
+		seq_pulse_norm_sum
+		seq_pulse_scaling
+
+	PREPARE
+		seq_minimum_te
+		seq_minimum_tr
+
+		seq_total_measure_time
+		seq_relevant_readouts_meas_time
+
+	INFORMATION BART TO SEQUENCE
+		seq_get_interface_conf
+		seq_print_info_config
+		seq_print_info_radial_views
+
+	CUSTOM_UI + UI INTERFACE
+		seq_custom_ui_free
+		seq_custom_ui_init
+
+		seq_config_from_string: cmdline to UI
+
+		seq_ui_interface_custom_params
+		seq_ui_interface_loop_dims
+		seq_ui_interface_standard_conf
+
+		seq_set_fov_pos: slice shift handling for SMS
+		seq_raga_spokes: set number of spokes in UI (eg. RAGA full frame size)
+
+
+	UTEST
+		debug_printf
+		num_rand_init

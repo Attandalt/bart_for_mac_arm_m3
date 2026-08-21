@@ -1,0 +1,666 @@
+/* Copyright 2025-2026. Institute of Biomedical Imaging. TU Graz.
+ * All rights reserved. Use of this source code is governed by
+ * a BSD-style license which can be found in the LICENSE file.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <complex.h>
+#include <math.h>
+
+#include "num/multind.h"
+
+#include "misc/mmio.h"
+#include "misc/opts.h"
+#include "misc/misc.h"
+#include "misc/version.h"
+#include "misc/debug.h"
+#include "misc/mri.h"
+
+#include "seq/config.h"
+#include "seq/event.h"
+#include "seq/seq.h"
+#include "seq/helpers.h"
+#include "seq/misc.h"
+
+#include "pulseq.h"
+
+#define MAX_LINE_LENGTH 100
+
+#define VEC(T) struct { int len; typeof(T) data[]; }
+
+#define VEC_LEN(x) ({ auto _x = (x); (_x ? _x->len : 0); })
+
+#define	VEC_ADD(v, o) 										\
+do {												\
+	auto _p = &(v);										\
+	auto _o = (o);										\
+	typedef typeof((*_p)->data[0]) eltype_t;						\
+	int n2 = VEC_LEN(*_p) + 1;								\
+	*_p = xrealloc(*_p, (size_t)((long)sizeof(**_p) + n2 * (long)sizeof(eltype_t)));	\
+	(*_p)->len = n2;									\
+	(*_p)->data[n2 - 1] = _o;								\
+} while (0)
+
+
+#define SECTIONS(X) X(VERSION) X(DEFINITIONS) X(BLOCKS) X(GRADIENTS) X(TRAP) X(RF) X(ADC) X(EXTENSIONS) X(SHAPES) X(SIGNATURE)
+#define BLOCKS_FORMAT "%4d %lu %d %d %d %d %d %d"
+#define BLOCKS_ACCESS(X) X(num) X(dur) X(rf) X(g[0]) X(g[1]) X(g[2]) X(adc) X(ext)
+#define GRADIENTS_FORMAT "%d %lf %d %d %lu"
+#define GRADIENTS_ACCESS(X) X(id) X(amp) X(shape_id) X(time_id) X(delay)
+#define TRAP_FORMAT "%d %lf %lu %lu %lu %lu"
+#define TRAP_ACCESS(X) X(id) X(amp) X(rise) X(flat) X(fall) X(delay)
+#define ADC_FORMAT "%d %lu %lu %lu %lf %lf"
+#define ADC_ACCESS(X) X(id) X(num) X(dwell) X(delay) X(freq) X(phase)
+#define EXTENSIONS_FORMAT "%d %d %d %d"
+#define EXTENSIONS_ACCESS(X) X(id) X(type) X(ref) X(next)
+#define RF_FORMAT "%d %lf %d %d %d %lu %lf %lf"
+#define RF_ACCESS(X) X(id) X(mag) X(mag_id) X(ph_id) X(time_id) X(delay) X(freq) X(phase)
+
+
+static struct shape make_shape(int id, int num, int len, const double val[len])
+{
+	struct shape shape = { id, num, NULL };
+
+	bool compression = (num != len);
+	double value = 0.;
+
+	for (int i = 0; i < len; i++) {
+
+		int count = 1;
+
+		double update = val[i];
+
+		if (compression && (0 < i) && (i < len - 1) && (val[i - 1] == val[i]))
+			count += val[++i];
+
+		while (count--)
+			VEC_ADD(shape.values, (compression) ? value += update : update);
+	}
+
+	assert(VEC_LEN(shape.values) == num);
+	return shape;
+}
+
+static struct shape make_compressed_shape(int id, int len, const double val[len])
+{
+	struct shape shape = { id, len, NULL };
+
+	double der = 0.;
+	int count = 0;
+
+	for (int i = 0; i < len; i++) {
+
+		double der_i = val[i] - ((0 == i) ? 0. : val[i - 1]);
+		der_i = (1.e-8 > fabs(der_i)) ? 0. : der_i;
+
+		if (1.e-12 > fabs(der - der_i)) {
+
+			if (count < 2)
+				VEC_ADD(shape.values, der_i);
+
+			count++;
+
+		} else {
+
+			if (count >= 2)
+				VEC_ADD(shape.values, count - 2);
+
+			VEC_ADD(shape.values, der_i);
+
+			der = der_i;
+			count = 1;
+		}
+	}
+
+	if (count >= 2)
+		VEC_ADD(shape.values, count - 2);
+
+	if ((int)(0.75 * len) < VEC_LEN(shape.values)) {
+
+		debug_printf(DP_DEBUG3, "insufficient forced compression (%d/%d), return uncompressed shape\n", 
+					VEC_LEN(shape.values), len);
+
+		xfree(shape.values);
+
+		return make_shape(id, len, len, val); // uncompressed shape because num == len
+	}
+
+	return shape;
+}
+
+static double fovz(const struct seq_config* seq)
+{
+	long slices = get_slices(seq);
+
+	double min_pos = seq->geom.shift[0][2];
+	double max_pos = seq->geom.shift[0][2];
+
+	for (int i = 1; i < slices; i++) {
+
+		min_pos = MIN(seq->geom.shift[i][2], min_pos);
+		max_pos = MAX(seq->geom.shift[i][2], max_pos);
+	}
+
+	return (max_pos - min_pos + seq->geom.slice_thickness
+			+ seq->geom.sms_distance * (seq->geom.mb_factor - 1));
+}
+
+void pulseq_init(struct pulseq *ps, const struct seq_config* seq)
+{
+	*ps = (struct pulseq) {
+
+		.version = { 1, 4, 2, },
+		.adc_raster_time = 1.e-7,
+		.gradient_raster_time = 1.e-5,
+		.block_raster_time = 1.e-5,
+		.rf_raster_time = 1.e-6,
+		.fov = {
+			seq->geom.fov,
+			seq->geom.fov,
+			fovz(seq),
+		},
+		.total_duration = 0.,
+		.label_flags = md_nontriv_dims(DIMS, seq->loop_dims)
+			& (SEQ_FLAGS | TE_FLAG) & ~(COEFF_FLAG | COEFF2_FLAG| ITER_FLAG), // MDH dimension to write
+	};
+}
+
+
+void pulseq_free(struct pulseq *ps)
+{
+	xfree(ps->ps_blocks);
+	xfree(ps->gradients);
+	xfree(ps->trapezoids);
+	xfree(ps->adcs);
+	xfree(ps->rfpulses);
+
+	for (int i = 0; i < VEC_LEN(ps->shapes); i++)
+		xfree(ps->shapes->data[i].values);
+
+	xfree(ps->shapes);
+
+	xfree(ps->extensions);
+
+	for (int i = 0; i < VEC_LEN(ps->extension_spec); i++)
+		xfree(ps->extension_spec->data[i].values);
+
+	xfree(ps->extension_spec);
+}
+
+
+void pulse_shapes_to_pulseq(struct pulseq *ps, int N, const struct rf_shape rf_shapes[N])
+{
+	assert(NULL == ps->shapes);
+	double tmp[2] = { 0., 0. };
+
+	for (int i = 0; i < N; i++) {
+
+		long samples = rf_shapes[i].samples;
+
+		double mag[samples];
+		double pha[samples];
+		double time[samples];
+
+		int mag_id = 3 * i + 1;
+
+		float m;
+		float p;
+
+		for (int j = 0; j < samples; j++) {
+
+			seq_cfl_to_sample(&rf_shapes[i], j, &m, &p);
+
+			mag[j] = (double)m;
+			pha[j] = round(1.e5 * (double)p / (2 * M_PI)) * 1.e-5;
+			time[j] = round(j * rf_shapes[i].sar_dur / rf_shapes[i].samples / ps->rf_raster_time);
+		}
+
+		VEC_ADD(ps->shapes, make_compressed_shape(mag_id, samples, mag));
+		VEC_ADD(ps->shapes, make_compressed_shape(mag_id + 1, samples, pha));
+
+		if (rf_shapes[i].samples != (rf_shapes[i].sar_dur / ps->rf_raster_time))
+			VEC_ADD(ps->shapes, make_compressed_shape(mag_id + 2, samples, time));
+		else
+		 	VEC_ADD(ps->shapes, make_compressed_shape(mag_id + 2, 2, tmp));
+	}
+}
+
+
+static bool check_empty_shape(const int len, const double shape[len])
+{
+	for (int j = 0; j < len; j++)
+		if (0. != shape[j])
+			return false;
+
+	return true;
+}
+
+
+static int find_grad_id(const struct pulseq* ps, int shape_id)
+{
+	for (int i = 0; i < VEC_LEN(ps->gradients); i++)
+		if (ps->gradients->data[i].shape_id == shape_id)
+			return ps->gradients->data[i].id;
+
+	return -1;
+}
+
+static int check_existing_gradient_shape(const struct pulseq* ps, const struct shape* shape2)
+{
+	for (int i = 0; i < VEC_LEN(ps->shapes); i++) {
+
+		struct shape sh = ps->shapes->data[i];
+
+		if (VEC_LEN(sh.values) != VEC_LEN(shape2->values))
+			continue;
+
+		bool equal = true;
+
+		for (int j = 0; j < VEC_LEN(sh.values); j++) {
+
+			if (1.e-12 < fabs(sh.values->data[j] - shape2->values->data[j])) {
+
+				equal = false;
+				break;
+			}
+		}
+
+		if (equal)
+			return find_grad_id(ps, sh.id);
+	}
+
+	return -1;
+}
+
+static void grad_to_pulseq(int grad_id[3], struct pulseq *ps, struct seq_sys sys, long grad_start,
+			  long grad_len, double g[SEQ_MAX_GRAD_POINTS][3])
+{
+	double g_axis[grad_len];
+
+	for (int a = 0; a < 3; a++) {
+
+		for (int i = 0; i < grad_len; i++)
+			g_axis[i] = - g[i + grad_start][a] / sys.grad.max_amplitude; // -1. for consistency
+
+		if (check_empty_shape(grad_len, g_axis))
+			continue;
+
+		int sid = VEC_LEN(ps->shapes) + 1;
+		struct shape tmp_shape = make_compressed_shape(sid, grad_len, g_axis);
+
+		int gid2 = check_existing_gradient_shape(ps, &tmp_shape);
+
+		if (0 < gid2) {
+
+			debug_printf(DP_DEBUG3, "re-using existing gradient %d instead of new shape_id %d\n", gid2, sid);
+
+			xfree(tmp_shape.values);
+
+			grad_id[a] = gid2;
+
+		} else {
+
+			VEC_ADD(ps->shapes, tmp_shape);
+
+			grad_id[a] = VEC_LEN(ps->gradients) + 1;
+
+			struct gradient g = {
+
+				.id = grad_id[a],
+				.amp = sys.grad.max_amplitude * sys.gamma,
+				.shape_id = sid
+			};
+
+			VEC_ADD(ps->gradients, g);
+		}
+	}
+}
+
+static double phase_pulseq(const struct seq_event* ev)
+{
+	double phase_mid = (SEQ_EVENT_PULSE == ev->type) ? ev->pulse.phase : ev->adc.phase;
+	double freq = (SEQ_EVENT_PULSE == ev->type) ? ev->pulse.freq : ev->adc.freq;
+	double ret = fmod(DEG2RAD(- freq * 360. * (ev->mid - ev->start) + phase_mid), 2. * M_PI);
+
+	return (ret < 0.) ? (ret + 2. * M_PI) : ret;
+}
+
+static int adc_to_pulseq(struct pulseq *ps, int i_adc, long block_start, int N, const struct seq_event ev[N])
+{
+	int adc_idx = events_idx(i_adc, SEQ_EVENT_ADC, N, ev);
+
+	if (0 > adc_idx)
+		return 0;
+
+	assert(SEQ_EVENT_ADC == ev[adc_idx].type);
+
+	int adc_id = VEC_LEN(ps->adcs) + 1;
+
+	long samples = lround(ev[adc_idx].adc.columns * ev[adc_idx].adc.os);
+
+	if (samples % 2) {
+
+		samples++;
+		debug_printf(DP_WARN, "requested samples %ld increased to %ld\n", samples - 1, samples);
+	}
+
+	struct adc a = {
+
+		.id = adc_id,
+		.num = (uint64_t)samples,
+		.dwell = (uint64_t)lround(ev[adc_idx].adc.dwell_ns / ev[adc_idx].adc.os),
+		.delay = round(1.E6 * (ev[adc_idx].start - block_start)),
+		.freq = ev[adc_idx].adc.freq,
+		.phase = phase_pulseq(&ev[adc_idx])
+	};
+
+	VEC_ADD(ps->adcs, a);
+
+	return adc_id;
+}
+
+static int label_check_spec(struct pulseq* ps, struct extension_spec es)
+{
+	for (int i = 0; i < VEC_LEN(ps->extension_spec); i++)
+		if (0 == strcmp(ps->extension_spec->data[i].string_id, es.string_id))
+			return i;
+
+	return -1;
+}
+
+static const char* dim_to_string(int dim)
+{
+	switch (dim) {
+
+	case PHS1_DIM: return "LIN";
+	case TIME_DIM: return "REP";
+	case SLICE_DIM: return "SLC";
+	case TE_DIM: return "ECO";
+	case PHS2_DIM: return "PAR";
+	case CSHIFT_DIM: return "SET";
+	case BATCH_DIM: return "SEG";
+	case TIME2_DIM: return "PHS";
+	case AVG_DIM: return "AVG";
+	default: assert(0);
+	}
+}
+
+
+static int label_set(struct pulseq* ps, const char* set, struct seq_event adc_ev)
+{
+	struct extension_spec es;
+	es.string_id = set;
+
+	int idx = label_check_spec(ps, es);
+
+	for (int i = 0; i < DIMS; i++) {
+
+		if (MD_IS_SET(ps->label_flags, i)) {
+
+			struct ext e = { (int)adc_ev.adc.pos[i], i };
+
+			if (0 > idx) {
+
+				idx = VEC_LEN(ps->extension_spec);
+				es.type = idx + 1;
+				es.values = NULL;
+
+				VEC_ADD(es.values, e);
+				VEC_ADD(ps->extension_spec, es);
+				continue;
+			}
+
+			VEC_ADD(ps->extension_spec->data[idx].values, e);
+		}
+	}
+
+	return idx + 1;
+}
+
+static int ext_to_pulseq(struct pulseq *ps, int i_adc, int N, const struct seq_event ev[N])
+{
+	int adc_idx = events_idx(i_adc, SEQ_EVENT_ADC, N, ev);
+	if (0 > adc_idx)
+		return 0;
+
+	assert(SEQ_EVENT_ADC == ev[adc_idx].type);
+
+	int labels = bitcount(ps->label_flags);
+	int es_type = label_set(ps, "LABELSET", ev[adc_idx]);
+
+	int ext_id = VEC_LEN(ps->extensions) + 1;
+
+	for (int i = 0; i < labels; i++) {
+
+		struct extension e = {
+
+			.id = ext_id + i,
+			.type = es_type,
+			.ref = ext_id + i,
+			.next = ((i + 1) == labels) ? 0 : ext_id + i + 1,
+		};
+
+		VEC_ADD(ps->extensions, e);
+	}
+
+	return ext_id;
+}
+
+static int check_existing_rf(const struct pulseq* ps, const struct rfpulse* rf)
+{
+	for (int i = 0; i < VEC_LEN(ps->rfpulses); i++) {
+
+		if (   (ps->rfpulses->data[i].mag_id == rf->mag_id)
+		    && (ps->rfpulses->data[i].ph_id == rf->ph_id)
+		    && (ps->rfpulses->data[i].time_id == rf->time_id)
+		    && (ps->rfpulses->data[i].delay == rf->delay)
+		    && (1e-5 > fabs(ps->rfpulses->data[i].mag - rf->mag))
+		    && (1e-5 > fabs(ps->rfpulses->data[i].freq - rf->freq))
+		    && (1e-5 > fabs(ps->rfpulses->data[i].phase - rf->phase)))
+			return ps->rfpulses->data[i].id;
+	}
+
+	return -1;
+}
+
+static int rf_to_pulseq(struct pulseq *ps, int M, const struct rf_shape rf_shapes[M], int N, const struct seq_event ev[N])
+{
+	int rf_idx = events_idx(0, SEQ_EVENT_PULSE, N, ev);
+
+	if (0 > rf_idx)
+		return 0;
+
+	assert(SEQ_EVENT_PULSE == ev[rf_idx].type);
+	int rf_id = VEC_LEN(ps->rfpulses) + 1;
+
+	int pulse_id = ev[rf_idx].pulse.shape_id;
+	int mag_id = 3 * pulse_id + 1;
+
+	double ampl = rf_shapes[pulse_id].max / (2. * M_PI) * (ev[rf_idx].pulse.fa / rf_shapes[pulse_id].fa_prep);
+
+	int time_id = 0;
+
+	if (rf_shapes[pulse_id].samples != (rf_shapes[pulse_id].sar_dur / ps->rf_raster_time))
+		time_id = mag_id + 2;
+
+	struct rfpulse rf = {
+
+		.id = rf_id,
+		.mag = ampl,
+		.mag_id = mag_id,
+		.ph_id = mag_id + 1,
+		.time_id = time_id,
+		.delay = round(1.E6 * ev[rf_idx].start),
+		.freq = ev[rf_idx].pulse.freq,
+		.phase = phase_pulseq(&ev[rf_idx])
+	};
+
+	int rf_id2 = check_existing_rf(ps, &rf);
+
+	if (0 < rf_id2) {
+
+		debug_printf(DP_DEBUG3, "re-using existing RF %d \n", rf_id2);
+		return rf_id2;
+	}
+
+	VEC_ADD(ps->rfpulses, rf);
+	return rf_id;
+}
+
+
+void events_to_pulseq(struct pulseq *ps, enum seq_block mode, double tr, struct seq_sys sys, int M, const struct rf_shape rf_shapes[M], int N, const struct seq_event ev[N])
+{
+	int n_blocks = MAX(1, events_counter(SEQ_EVENT_ADC, N, ev));
+
+	if (1 < events_counter(SEQ_EVENT_PULSE, N, ev))
+		error("Multiple RFs per block not supported\n");
+
+	long dur = lround(seq_block_end(N, ev, mode, tr, ps->block_raster_time) / ps->block_raster_time);
+	ps->total_duration += dur * ps->block_raster_time;
+
+	double grad_shapes[SEQ_MAX_GRAD_POINTS][3];
+	seq_compute_gradients(SEQ_MAX_GRAD_POINTS, grad_shapes, ps->gradient_raster_time, N, ev);
+
+	long grad_len = lround((seq_block_end_flat(N, ev, ps->block_raster_time) + seq_block_rdt(N, ev, ps->block_raster_time)) / ps->block_raster_time);
+
+	if (grad_len > dur)
+		error("Gradient length %ld exceeds block duration %ld\n", grad_len, dur);
+
+	long dur_split = dur;
+	long grad_start = 0;
+
+	for (int i = 0; i < n_blocks; i++) {
+
+		int adc_id = adc_to_pulseq(ps, i, grad_start * 10, N, ev);
+
+		if ((i != (n_blocks - 1)) && (0 < adc_id))
+			dur_split = (round_up_raster((ev[events_idx(i, SEQ_EVENT_ADC, N, ev)].end), ps->block_raster_time) + 2. * ps->block_raster_time) / ps->block_raster_time - grad_start;
+		else
+			dur_split = dur - grad_start;
+
+		int ext_id = 0;
+		if (adc_id)
+			ext_id = ext_to_pulseq(ps, i, N, ev);
+
+		int rf_id = 0;
+		if (0 == i)
+			rf_id = rf_to_pulseq(ps, M, rf_shapes, N, ev);
+
+		int g_id[3] = { 0, 0, 0 };
+
+		grad_to_pulseq(g_id, ps, sys, grad_start, MIN(grad_len, dur_split), grad_shapes);
+
+		grad_start += dur_split;
+
+		struct ps_block b = {
+
+			.num = VEC_LEN(ps->ps_blocks) + 1,
+			.dur = (unsigned long)dur_split,
+			.rf = rf_id,
+			.g = { g_id[0], g_id[1], g_id[2] },
+			.adc = adc_id,
+			.ext = ext_id
+		};
+
+		VEC_ADD(ps->ps_blocks, b);
+	}
+}
+
+void pulseq_writef(FILE *fp, struct pulseq *ps)
+{
+	fprintf(fp, "# Pulseq sequence file\n"
+		    "# Created by BART %s\n", bart_version);
+
+	fprintf(fp, "# bart %s\n", command_line);
+
+	fprintf(fp, "\n[VERSION]\nmajor %d\nminor %d\nrevision %d\n",
+		ps->version[0], ps->version[1], ps->version[2]);
+
+	fprintf(fp, "\n[DEFINITIONS]\n");
+	fprintf(fp, "AdcRasterTime %.e\n", ps->adc_raster_time);
+	fprintf(fp, "BlockDurationRaster %.e\n", ps->block_raster_time);
+	fprintf(fp, "GradientRasterTime %.e\n", ps->gradient_raster_time);
+	fprintf(fp, "RadiofrequencyRasterTime %.e\n", ps->rf_raster_time);
+	fprintf(fp, "FOV %.3f %.3f %.3f \n", ps->fov[0], ps->fov[1], ps->fov[2]);
+	fprintf(fp, "PhaseResolution 1.0 \n"); // we have to set this for the interpreter [ otherwise small LIN counter --> crash]
+	fprintf(fp, "TotalDuration %.5f\n", ps->total_duration);
+
+	fprintf(fp, "\n\n# Format of blocks:\n");
+	fprintf(fp, "# NUM DUR RF  GX  GY  GZ  ADC  EXT");
+	fprintf(fp, "\n[BLOCKS]\n");
+#define ACCESS(X) , ps->ps_blocks->data[i].X
+	for (int i = 0; i < VEC_LEN(ps->ps_blocks); i++)
+		fprintf(fp, BLOCKS_FORMAT "\n" BLOCKS_ACCESS(ACCESS));
+#undef	ACCESS
+
+	fprintf(fp, "\n[ADC]\n");
+#define ACCESS(X) , ps->adcs->data[i].X
+	for (int i = 0; i < VEC_LEN(ps->adcs); i++)
+		fprintf(fp, ADC_FORMAT "\n" ADC_ACCESS(ACCESS));
+#undef	ACCESS
+
+	if (NULL != ps->extensions) {
+
+		fprintf(fp, "\n[EXTENSIONS]\n");
+#define ACCESS(X) , ps->extensions->data[i].X
+		for (int i = 0; i < VEC_LEN(ps->extensions); i++)
+			fprintf(fp, EXTENSIONS_FORMAT "\n" EXTENSIONS_ACCESS(ACCESS));
+#undef	ACCESS
+
+		fprintf(fp, "\n#id set labelstring");
+
+		struct extension_spec es = ps->extension_spec->data[0];
+		fprintf(fp, "\nextension %s %d\n", es.string_id, es.type);
+
+		for (int j = 0; j < VEC_LEN(es.values); j++)
+			fprintf(fp, "%d %d %s\n", j + 1, es.values->data[j].val, dim_to_string(es.values->data[j].dim));
+	}
+
+
+	fprintf(fp, "\n[GRADIENTS]\n");
+#define ACCESS(X) , ps->gradients->data[i].X
+	for (int i = 0; i < VEC_LEN(ps->gradients); i++)
+		fprintf(fp, GRADIENTS_FORMAT "\n" GRADIENTS_ACCESS(ACCESS));
+#undef	ACCESS
+
+	fprintf(fp, "\n[TRAP]\n");
+#define ACCESS(X) , ps->trapezoids->data[i].X
+	for (int i = 0; i < VEC_LEN(ps->trapezoids); i++)
+		fprintf(fp, TRAP_FORMAT "\n" TRAP_ACCESS(ACCESS));
+#undef	ACCESS
+
+	fprintf(fp, "\n[RF]\n");
+#define ACCESS(X) , ps->rfpulses->data[i].X
+	for (int i = 0; i < VEC_LEN(ps->rfpulses); i++)
+		fprintf(fp, RF_FORMAT "\n" RF_ACCESS(ACCESS));
+#undef	ACCESS
+
+	fprintf(fp, "\n[SHAPES]\n");
+
+	for (int i = 0; i < VEC_LEN(ps->shapes); i++) {
+
+		fprintf(fp, "\nshape_id %d\n", i + 1);
+
+		struct shape sh = ps->shapes->data[i];
+
+		fprintf(fp, "num_samples %d\n", sh.num);
+
+		for (int j = 0; j < VEC_LEN(sh.values); j++) {
+
+			if (1 < sh.values->data[j])
+				fprintf(fp, "%d\n", (int)sh.values->data[j]);
+			else
+				fprintf(fp, "%.10f\n", sh.values->data[j]);
+		}
+	}
+
+	fprintf(fp, "\n[SIGNATURE]\n");
+	fprintf(fp, "# TODO\n");
+
+	pulseq_free(ps);
+}
+
+

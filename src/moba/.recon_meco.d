@@ -1,0 +1,42 @@
+/Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/recon_meco.o: \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/recon_meco.c \
+  src/main.h src/misc/cppmap.h src/mainlist.inc \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/multind.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/cppwrap.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/nested.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/types.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/misc.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/flpmath.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/fft.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/iovec.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/ops_p.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/rand.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/dllspec.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/italgos.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/iter2.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/iter3.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/iter4.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/lsqr.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/iter.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/itop.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/prox.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/iter/thresh.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/mri.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/misc/debug.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/nlops/nlop.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/linops/linop.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/num/ops.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/noir/model.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/simu/signals.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/wavelet/wavthresh.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/lowrank/lrthresh.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/grecon/optreg.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/grecon/italgo.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/iter_l1.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/meco.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/model_meco.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/moba.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/simu/simulation.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/seq/pulse.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/recon_meco.h \
+  /Users/shaoyouye/Documents/ResearchCode/MRreconToolbox/bart/src/moba/optreg.h
