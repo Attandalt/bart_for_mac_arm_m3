@@ -1,21 +1,20 @@
 
 # BART installation Instructions(MacOS) for arm(M3)
 ## 1. Xcode CommandLineTools is required
-xcode-select --install
+$ xcode-select --install
 
 ## 2. download BART source code
-git clone https://github.com/mrirecon/bart
+$ git clone https://github.com/mrirecon/bart
 or download zip file from https://codeberg.org/mrirecon/bart/releases
 
 ## 3. brew install dependency
-'''
-brew install --cask gcc-arm-embedded
-brew install libpng
-brew install fftw
-brew install openblas
-brew install make
-brew install llvm libomp
-'''
+$ brew install --cask gcc-arm-embedded
+$ brew install libpng
+$ brew install fftw
+$ brew install openblas
+$ brew install make
+$ brew install llvm libomp
+
 
 ## 4.If using Homebrew to install this lib, we need to change some code for makefiles
 
